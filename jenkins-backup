@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+# @author  asoiso@foxmail.com
+# @version 0.1.0
+# @update  2017-03-17
+# 备份jenkins
+
+source=/var/lib/jenkins/
+tmp_dir=/home/backup/tmp/
+bak_dir=/home/backup/
+bak_file=jenkins-backup-`(date '+%Y%m%d%H%M')`.tar.gz
+
+rsync  -az --delete --verbose --exclude=workspace $source $tmp_dir
+tar -czvf $bak_dir$bak_file $tmp_dir
+rm -rf $tmp_dir
+ls -a $bak_dir
+echo "$bak_dir$bak_file备份成功"
