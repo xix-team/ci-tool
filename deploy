@@ -1,0 +1,369 @@
+#!/usr/bin/env bash
+# @author  asoiso@foxmail.com
+# @version 0.5.0
+# @update  2016-04-22
+
+# 项目名称,决定了发布到git库的默认工作目录和默认的prd发布的git地址
+project=${!#}
+
+# 脚本目录
+base_path=$(cd `dirname $0`; pwd)
+
+# 源目录
+from=""
+# 目标目录
+to=""
+# 项目提交的分支或标签名称, 如refs/remotes/origin/master,develop,hotfix/1.0.0,release/1.0.0
+ref=""
+
+# 服务环境,脚本会自动根据env_rule计算ref对应的服务环境, dev=开发环境 sit=系统集成测试环境 uat=用户验收测试环境 prd=生产环境
+env=""
+
+# 项目版本号
+version=""
+
+# 发布排除文件列表,同rsync --exclude
+# exclude='--exclude=aaa --exclude=bbb'
+exclude="--exclude=.git --exclude=.svn --exclude=build.txt"
+
+# 默认的prd发布地址,暂时直接发机器,等ansible弄好了,再切回来
+#default_prd=git@git.vveshow.com:dist/$project.git
+default_prd=$PRD_APACHE1,$PRD_APACHE2
+# 默认的prd发布的git的分支
+target_branch=master
+# 发布到git库的默认工作目录
+
+dist=$JENKINS_HOME/dist/$project
+
+# 默认编译号
+build=$(date +%Y%m%d%H%M)
+
+# 默认替换环境参数的文件后缀,环境参数为[@ENV@|@VERSION@|@BUILD@]
+replace_suffix="ini|conf|manifest|css|js|php|jsp|asp|txt|json|xml|htm|xhtml|html|ftl|tpl|tmpl|txt|md"
+replace_dir=""
+
+# 默认的目标服务器
+target=""
+# 目标开发环境
+target_dev=""
+# 目标系统集成测试环境
+target_sit=""
+# 目标系统集成测试环境
+target_uat=""
+# 目标生产环境
+target_prd=""
+
+# 发布前执行的远程目标服务器的脚本
+deploy_before=""
+
+# 发布后执行的远程脚本
+deploy_before=""
+
+usage()
+{
+  cat <<EOF
+Usage: deploy --from=<from> --to=<to> --ref=<ref> --target-dev=<target> --target-sit=<target> --target-uat=<target> --target-<target>=<target> [options] <project>
+
+解析开发人员提交的源码分支的引用名称(ref),得出目标环境(env),在构建前把源码中的环境参数[@ENV@|@REF@|@VERSION@|@BUILD@]替换,在构建后,把可运行程序从源目录(from)发布到目标环境(target-env)的目标目录(to)
+
+Options:
+  --from=<from>             必填,源目录,结尾不需要带/               eg: /var/lib/jenkins/workspace/project
+  --to=<to>                 必填,目标目录,结尾不需要带/             eg: /usr/src/project
+  --ref=<ref>               当前要发布的项目的分支名称,当分支为master、release-*、tag的时候会促发git发布 eg: master release/* hotfix/* release-v1 release-v2 develop
+
+  target是指目标服务器,值为<local|[user@]host|git>可以设置多个,用逗号分隔 eg: lijian@10.8.82.11,lijian@10.8.64.35
+  --target-dev=<target>     dev环境 feature   -> dev
+  --target-sit=<target>     sit环境 develop   -> sit
+  --target-uat=<target>     uat环境 master/*,release/*,hotfix/* -> uat
+  --target-prd=<target>     prd环境 tags/x.x.x -> dist
+  --target-branch=<branch>  提交到target的git的指定分支,默认为master
+
+  --deploy-before=<shell>   发布前执行的远程脚本
+  --deploy-after=<shell>    发布后执行的远程脚本
+
+  --build=<build>           编译号,默认为当前时间,eg:20160501103020
+  --clean                   保持from和to内容完全一致,默认为false
+  --verbose                 显示发布详情
+  --replace-dir=<dir>       替换参数的文件的目录,默认为源目录的根目录,可设置为子目录,替换的环境参数为[@ENV@|@VERSION@|@BUILD@]
+  --replace-suffix=<suffix> 替换参数的文件后缀,默认:ini|conf|htm|html|xhtml|ftl|tpl|css|js|json|manifest
+  --replace-to              是否替换prd参数
+  --help                    help
+EOF
+  exit $1
+}
+
+
+if [ $# -eq 0 ]; then
+    usage 1 1>&2
+fi
+
+if [[ "$project" =~ ^\- ]]; then
+    echo "Error: project is required"
+    usage 1 1>&2
+fi
+
+if [ "$JENKINS_HOME" == "" ]; then
+    echo "Error: JENKINS_HOME is undefined"
+    usage 1 1>&2
+fi
+
+while test $# -gt 0; do
+    case "$1" in
+        -*=*)
+            arg=`echo "$1" | sed 's/[-_a-zA-Z0-9]*=//'`
+            ;;
+        *)
+            arg=
+            ;;
+    esac
+    case "$1" in
+        --from=*)
+          from=$arg
+          if [[ "$from" == "" ]]; then
+            echo "Error: from is required"
+            exit 1
+          fi
+          ;;
+        --to=*)
+          to=$arg
+          if [[ "$to" == "" ]]; then
+            echo "Error: to is required"
+            exit 1
+          fi
+          ;;
+        --target-dev=*)
+          target_dev=$arg
+          ;;
+        --target-sit=*)
+          target_sit=$arg
+          ;;
+        --target-uat=*)
+          target_uat=$arg
+          ;;
+        --target-prd=*)
+          target_prd=$arg
+          if [ "$target_prd" == "default" ]; then
+          	 target_prd=$default_prd
+          fi
+          ;;
+        --target-branch=*)
+          target_branch=$arg
+          ;;
+        --deploy-before=*)
+          deploy_before=$arg
+          ;;
+        --deploy-after=*)
+          deploy_after=$arg
+          ;;
+        --ref=*)
+          # 转换ref为最后两位,并且把/替换为-
+          ref=$(echo $arg | awk '{gsub(/(refs|remotes|origin|heads|tags)\//, "");print $0;}' | awk '{gsub(/\//, "-");print $0;}')
+          # 计算服务环境,ref对应服务环境的规则
+          # env=$(echo $ref | awk --posix '{if($0~/^[0-9]+(\.[0-9]+){1,3}$/){i="prd"}else if($0~/^master/){i="uat"}else if($0~/^release/){i="uat"}else if($0~/^develop/){i="sit"}else if($0~/^hotfix/){i="uat"}else if($0~/^feature$/){i="dev"}print i}' )
+          # env=$(echo $ref | awk --posix '{if($0~/^[0-9]+(\.[0-9]+){1,3}$/){i="prd"}else if($0~/^master/){i="uat"}else if($0~/^(release|hotfix|uat)/){i="uat"}else if($0~/^sit/){i="sit"}else if($0~/^develop/){i="dev"}print i}' )
+          env=`$base_path/detect $ref`
+          ;;
+        --build=*)
+          build=$(echo $arg |sed  's/\-//g;s/\_//g')
+          ;;
+        --replace-suffix=*)
+          replace_suffix=$arg
+          ;;
+        --replace-dir=*)
+          replace_dir=$arg
+          ;;
+        --replace-to)
+          replace_to=true
+          ;;
+        --clean)
+          clean="--delete"
+          ;;
+        --verbose)
+          verbose="--verbose"
+          ;;
+        --help | -h)
+          usage 0
+          ;;
+        -*)
+          echo "Error: unknown option $1"
+          usage 1 1>&2
+          ;;
+    esac
+  shift
+done
+
+
+if [ ! -d $from ]; then
+  echo "Error: No $from directory"
+  exit 1
+fi
+
+replaceParam(){
+  echo "========================================================================="
+  echo "[replace-params]"
+  printParam
+  if [ "$replace_dir"!="" ]; then
+      replace_dir="$from/$replace_dir"
+  else
+      replace_dir=$from
+  fi
+
+  echo "$replace_dir"
+
+  if [ -d $replace_dir -a "$replace_suffix"!="" ]; then
+    find $replace_dir | gawk '/\.('$replace_suffix')$/' | while read line
+    do
+      if [ -f $line ]; then
+        sed -i 's/@ENV@/'$env'/g;s/@REF@/'$ref'/g;s/@VERSION@/'$version'/g;s/@BUILD@/'$build'/g' $line
+      fi
+    done
+  fi
+}
+
+printParam(){
+  echo "ENV:$env"
+  echo "REF:$ref"
+  echo "VERSION:$version"
+  echo "BUILD:$build"
+}
+
+deployGit(){
+  echo "========================================================================="
+  echo "[deploy-git:$1]"
+  echo "from:$from"
+  echo "dist:$dist"
+  if [ -d $dist -a -d $dist/.git ]; then
+    cd $dist
+    echo "[pull]"
+    git config remote.origin.url "$1"
+    git reset --hard
+    git clean -fdx
+    git pull origin $target_branch || exit 3
+    if [ "$clean" != ""  ]; then
+      echo "[clean]"
+      rm -rf $dist/*
+    fi
+  else
+    echo "[clone]"
+    rm -rf $dist
+    git clone "$1"  $dist || exit 3
+    cd $dist
+  fi
+  echo "[rsync]"
+  rsync -azp $clean $verbose $exclude $from/ $dist/ || exit 3
+  echo "[push]"
+  git add --all && git commit -am $ref && git gc
+  git push -u origin $target_branch || exit 3
+  if [ "$env" == "prd" ]; then
+  git tag -am $ref $ref || exit 3;
+  git push --tags || exit 3;
+  fi
+  echo "========================================================================="
+
+}
+
+# 发布到目标机器
+deployRsync(){
+  echo "========================================================================="
+  echo "[deploy-rsync:$1]"
+  echo "from:$from"
+  # 发布到本机
+  if [ "$1" == "local" ]; then
+    echo "to:$to"
+    mkdir -p $to
+    if [ "$deploy_before" != "" ]; then
+      echo "before:$deploy_before"
+      exec "$deploy_before"
+    fi
+    rsync  -az $clean $verbose $exclude $from/ $to/ || exit 2
+    if [ "$deploy_after" != "" ]; then
+      echo "after:$deploy_after"
+      exec "$deploy_after"
+    fi
+  # 发布到远程
+  elif [ "$to" != "" ]; then
+    echo "to:$to"
+    ssh $1 "mkdir -p $to"
+    if [ "$deploy_before" != "" ]; then
+      echo "before:$deploy_before"
+      ssh $1 "$deploy_before"
+    fi
+    rsync  -zrltD $clean $verbose $exclude $from/ $1:$to/ || exit 2
+    if [ "$deploy_after" != "" ]; then
+      echo "after:$deploy_after"
+      ssh $1 "$deploy_after"
+    fi
+  fi
+  echo "========================================================================="
+}
+
+deploy(){
+
+	if [ "$1" != "" ]; then
+		list=($(echo $1 | tr ',' ' ' | tr -s ' '))
+		length=${#list[@]}
+		for (( i = 0; i < length; i++ )); do
+		   targeItem=${list[$i]}
+		   type=$(echo $targeItem | awk --posix '{if($0~/\.git$/){type="git"}else{type="rsync"}print type}');
+		   if [ "git" == "$type" ]; then
+		      	  deployGit $targeItem
+		   else
+		   	if [ "$to" != "" ]; then
+		   	   deployRsync $targeItem
+		   	fi
+		   fi
+		done
+	fi
+
+}
+
+
+main(){
+
+    # 如果提交的是标签,则以标签为版本号,如果提交的是其他的,则以commit为版本号
+    if [[ "$ref" =~ ^[0-9]+('.'[0-9]+){1,3}$ ]]; then
+        version=$ref
+    else
+        version=$build
+    fi
+
+	case "$env" in
+        dev)
+          target=$target_dev;
+        ;;
+		sit)
+	      target=$target_sit;
+		;;
+		uat)
+		  target=$target_uat;
+		;;
+		prd)
+		  target=$target_prd;
+		;;
+	esac
+
+	# 转换目标目录中的@ENV@ @REF@ @VERSION@ @BUILD@变量, prd环境不需要转换
+	if [ "$env" == "prd" -a "$replace_to" == "" ]; then
+        to=$(echo $to |sed  's/@ENV@\///g;s/@REF@\///g;s/@VERSION@\///g;s/@BUILD@\///g')
+	else
+	    to=${to//@ENV@/$env}
+        to=${to//@REF@/$ref}
+        to=${to//@VERSION@/$version}
+        to=${to//@BUILD@/$build}
+    fi
+
+
+  if [ "$target" != "" ]; then
+    replaceParam
+    deploy $target
+  else
+    printParam
+    echo "No target.";
+  fi
+
+}
+
+main
+
+
+
