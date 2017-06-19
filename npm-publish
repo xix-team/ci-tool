@@ -1,0 +1,57 @@
+#!/usr/bin/env bash
+# @author  asoiso@foxmail.com
+# @version 0.1.0
+# @update  2016-05-19
+# 自动发布npm组件
+# npm-publish <package> [ref]
+
+package=$1
+ref=$2
+
+main(){
+
+    if [ "$package" == "" ]; then
+        echo "npm-publish <package> [ref]"
+        exit 0
+    fi
+
+    if [ ! -d "$package" ]; then
+        echo "Error: No $package directory"
+        exit 1
+    fi
+
+    if [ ! -f "$package/package.json" ]; then
+        echo "Error: No package.json"
+        exit 1
+    fi
+
+    cd $package
+
+    if [ "$ref"  != "" ]; then
+      ref=$(echo $ref | awk '{gsub(/(refs|remotes|origin|heads|tags)\//, "");print $0;}' | awk '{gsub(/\//, "-");print $0;}')
+      if [[ "$ref" =~ ^[0-9]+(\.[0-9]+){1,3}$ ]]; then
+        git_version=$ref
+      else
+        echo 'No package needs to be publish.'
+        exit 0
+      fi
+    fi
+
+    if [ "$git_version"  == "" ]; then
+      git_version=$(git describe --abbrev=0 --tags)
+    fi
+
+    pkg_version=$(node -p "require('./package').version")
+
+    echo git_version:$git_version
+    echo pkg_version:$pkg_version
+
+    if [ "$git_version" == "$pkg_version" ]; then
+        npm publish
+    else
+        echo 'Package version mismatch.'
+        exit 1
+    fi
+}
+
+main
